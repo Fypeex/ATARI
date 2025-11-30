@@ -57,16 +57,6 @@ def evaluate(checkpoint_option: str, episodes: int):
             done = terminated or truncated
             ep_reward += reward
 
-            # Save the raw observation frame to disk immediately
-            arr = next_obs
-            if arr.dtype != np.uint8:
-                if arr.max() <= 1.0:
-                    arr = (arr * 255).astype(np.uint8)
-                else:
-                    arr = arr.astype(np.uint8)
-            Image.fromarray(arr).save(
-                os.path.join(OBS_SAVE_DIR, f"episode_{ep + 1:03d}_frame_{frame_i:05d}.png")
-            )
             frame_i += 1
 
             # Update state stack
