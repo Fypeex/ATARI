@@ -1,0 +1,9 @@
+ipython
+numpy
+torch
+gymnasium[atari]>=0.29.1
+ale-py
+autorom
+opencv-python
+pillow
+ipywidgets
