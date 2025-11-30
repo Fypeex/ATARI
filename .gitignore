@@ -1,0 +1,4 @@
+./observations
+./models/*.pth
+!./models/dqn_pong_model_10000000.pth
+.venv

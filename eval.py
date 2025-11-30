@@ -1,60 +1,25 @@
 import os
-import glob
 import argparse
 
 import gymnasium as gym
 import numpy as np
 import torch
+import ale_py  # noqa: F401 (ensure ALE environments are registered)
 from PIL import Image
 
 from nn import DQN
 from helper import preprocess_obs, init_state_stack, get_state_from_stack
+from config import DEVICE, VALID_ACTIONS, CHECKPOINT_DIR, OBS_SAVE_DIR
+from checkpoint import load_checkpoint as load_ckpt_util
 
-import ale_py
-
-# Same action mapping as in your training script
-VALID_ACTIONS = [0, 2, 3]  # 0 -> NOOP, 2/3 -> paddle up/down
-CHECKPOINT_DIR = "models"
-OBS_SAVE_DIR = "observations"
-
-def load_checkpoint(policy_net, device, checkpoint_option):
-    """
-    checkpoint_option:
-      - "latest": load most recent checkpoint in CHECKPOINT_DIR
-      - "<path>.pth": load specific file
-      - "none": do not load anything (random weights)
-
-    Returns frame_idx if present in checkpoint, else 0.
-    """
-    if checkpoint_option == "none":
-        print("[Eval] No checkpoint specified, using random weights.")
-        return 0
-
-    if checkpoint_option == "latest":
-        pattern = os.path.join(CHECKPOINT_DIR, "dqn_pong_model_*.pth")
-        ckpts = glob.glob(pattern)
-        if not ckpts:
-            print(f"[Eval] No checkpoints found in '{CHECKPOINT_DIR}', using random weights.")
-            return 0
-        ckpt_path = max(ckpts, key=os.path.getmtime)
-    else:
-        ckpt_path = checkpoint_option
-        if not os.path.isfile(ckpt_path):
-            print(f"[Eval] Specified checkpoint '{ckpt_path}' not found, using random weights.")
-            return 0
-
-    print(f"[Eval] Loading checkpoint from '{ckpt_path}'")
-    checkpoint = torch.load(ckpt_path, map_location=device)
-
-    policy_net.load_state_dict(checkpoint["policy_state_dict"])
-    frame_idx = int(checkpoint.get("frame_idx", 0))
-    print(f"[Eval] Loaded frame {frame_idx}")
-    return frame_idx
 
 
 def evaluate(checkpoint_option: str, episodes: int):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = DEVICE
     print("[Eval] Using device:", device)
+
+    # Ensure output directory exists
+    os.makedirs(OBS_SAVE_DIR, exist_ok=True)
 
     # Create env with human rendering so you can watch
     env = gym.make("ALE/Pong-v5", render_mode="human")
@@ -64,11 +29,9 @@ def evaluate(checkpoint_option: str, episodes: int):
     policy_net.eval()
 
     # Load checkpoint if requested
-    _ = load_checkpoint(policy_net, device, checkpoint_option)
+    _ = load_ckpt_util(policy_net, device, checkpoint_option, directory=CHECKPOINT_DIR)
 
     all_rewards = []
-
-    observations = []
 
     for ep in range(episodes):
         obs, info = env.reset()
@@ -77,6 +40,7 @@ def evaluate(checkpoint_option: str, episodes: int):
 
         done = False
         ep_reward = 0.0
+        frame_i = 0
 
         while not done:
             # Prepare state for network
@@ -92,27 +56,23 @@ def evaluate(checkpoint_option: str, episodes: int):
             next_obs, reward, terminated, truncated, info = env.step(env_action)
             done = terminated or truncated
             ep_reward += reward
-            observations.append(next_obs)
-            frame = preprocess_obs(next_obs)
-            stack.append(frame)
-            state = get_state_from_stack(stack)
 
-        #Save all observations as images
-        for i, obs_arr in enumerate(observations):
-            # Ensure uint8 HxWxC
-            arr = obs_arr
+            # Save the raw observation frame to disk immediately
+            arr = next_obs
             if arr.dtype != np.uint8:
-                # simple heuristic: assume [0,1] float, scale to [0,255]
                 if arr.max() <= 1.0:
                     arr = (arr * 255).astype(np.uint8)
                 else:
                     arr = arr.astype(np.uint8)
+            Image.fromarray(arr).save(
+                os.path.join(OBS_SAVE_DIR, f"episode_{ep + 1:03d}_frame_{frame_i:05d}.png")
+            )
+            frame_i += 1
 
-            img = Image.fromarray(arr)
-            img.save(os.path.join(
-                OBS_SAVE_DIR,
-                f"episode_{ep + 1:03d}_frame_{i:05d}.png"
-            ))
+            # Update state stack
+            frame = preprocess_obs(next_obs)
+            stack.append(frame)
+            state = get_state_from_stack(stack)
 
         all_rewards.append(ep_reward)
         print(f"[Eval] Episode {ep + 1}/{episodes} reward: {ep_reward:.1f}")
@@ -130,11 +90,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="latest",
+        default="none",
         help=(
             "Which checkpoint to load: "
-            "'latest' (default) for newest in models/, "
-            "'none' for random weights, or a specific path like "
+            "'latest' for newest in models/, "
+            "'none' (default) for random weights, or a specific path like "
             "'models/dqn_pong_model_100000.pth'."
         ),
     )

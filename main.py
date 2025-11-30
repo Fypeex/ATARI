@@ -1,20 +1,13 @@
-import os
-import glob
-import time
-
 import gymnasium as gym
 import torch
 import numpy as np
-from collections import deque
-
-import ale_py
-import cv2 as cv
-import win32gui
-from mss import mss
+import ale_py  # noqa: F401 (ensure ALE environments are registered)
 
 from helper import preprocess_obs, get_state_from_stack, init_state_stack
 from nn import DQN
 from rpbuf import ReplayBuffer
+from config import DEVICE, VALID_ACTIONS, CHECKPOINT_DIR
+from checkpoint import save_checkpoint as save_ckpt_util, load_checkpoint as load_ckpt_util
 
 # =========================
 # Checkpoint configuration
@@ -23,8 +16,7 @@ from rpbuf import ReplayBuffer
 #   "none"    -> start from scratch
 #   "latest"  -> load the most recent checkpoint in models/
 #   "<path>"  -> load a specific checkpoint file
-CHECKPOINT_OPTION = "latest"          # e.g. "none", "latest", "models/dqn_pong_model_100000.pth"
-CHECKPOINT_DIR = "models"
+CHECKPOINT_OPTION = "latest"  # e.g. "none", "latest", "models/dqn_pong_model_100000.pth"
 
 # ==============
 # NN Parameters
@@ -41,20 +33,19 @@ REPLAY_CAP = 400_000
 MAX_FRAMES = 10_000_000
 MOVE_PENALTY = 0
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = DEVICE
 print("Using device:", device)
 
 # ================
-# Game Parameters
+# Environment setup
 # ================
-VALID_ACTIONS = [0, 2, 3]  # 0 -> NOOP, 2/3 -> paddle up/down (depending on mapping)
 env = gym.make("ALE/Pong-v5", render_mode=None)
 obs, info = env.reset()
 stack = init_state_stack(obs)
-state = get_state_from_stack(stack)   # (4,84,84)
+state = get_state_from_stack(stack)  # (4,84,84)
 
 # ===============
-# CNN Setup
+# Networks & Optimizer
 # ===============
 policy_net = DQN(in_channels=4, num_actions=len(VALID_ACTIONS)).to(device)
 target_net = DQN(in_channels=4, num_actions=len(VALID_ACTIONS)).to(device)
@@ -70,59 +61,6 @@ replay = ReplayBuffer(cap=REPLAY_CAP)
 
 episode_reward = 0.0
 episode_move_count = 0
-
-
-# =====================
-# Checkpoint utilities
-# =====================
-def save_checkpoint(frame_idx: int):
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    ckpt_path = os.path.join(CHECKPOINT_DIR, f"dqn_pong_model_{frame_idx}.pth")
-    checkpoint = {
-        "frame_idx": frame_idx,
-        "policy_state_dict": policy_net.state_dict(),
-        "target_state_dict": target_net.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-    }
-    torch.save(checkpoint, ckpt_path)
-    print(f"[Checkpoint] Saved model at '{ckpt_path}' (frame {frame_idx})")
-
-
-def load_checkpoint(option: str) -> int:
-    """
-    Returns the starting frame index (0 if none loaded).
-    """
-    if option == "none":
-        print("[Checkpoint] Starting from scratch (no checkpoint).")
-        return 0
-
-    if option == "latest":
-        pattern = os.path.join(CHECKPOINT_DIR, "dqn_pong_model_*.pth")
-        ckpts = glob.glob(pattern)
-        if not ckpts:
-            print("[Checkpoint] No checkpoints found, starting from scratch.")
-            return 0
-        # Pick latest by modification time
-        ckpt_path = max(ckpts, key=os.path.getmtime)
-    else:
-        ckpt_path = option
-        if not os.path.isfile(ckpt_path):
-            print(f"[Checkpoint] Specified checkpoint '{ckpt_path}' not found, starting from scratch.")
-            return 0
-
-    print(f"[Checkpoint] Loading checkpoint from '{ckpt_path}'")
-    checkpoint = torch.load(ckpt_path, map_location=device)
-
-    policy_net.load_state_dict(checkpoint["policy_state_dict"])
-    if "target_state_dict" in checkpoint:
-        target_net.load_state_dict(checkpoint["target_state_dict"])
-    else:
-        target_net.load_state_dict(checkpoint["policy_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-
-    start_frame = int(checkpoint.get("frame_idx", 0))
-    print(f"[Checkpoint] Loaded frame {start_frame}")
-    return start_frame
 
 
 # ========================
@@ -174,58 +112,68 @@ def optimize_model():
     optimizer.step()
 
 
-# ==================================
-# Load checkpoint if requested
-# ==================================
-start_frame = load_checkpoint(CHECKPOINT_OPTION)
+if __name__ == "__main__":
+    # ==================================
+    # Load checkpoint if requested
+    # ==================================
+    start_frame = load_ckpt_util(
+        policy_net,
+        device,
+        CHECKPOINT_OPTION,
+        target_net=target_net,
+        optimizer=optimizer,
+        directory=CHECKPOINT_DIR,
+    )
 
-# =====================
-# Main training loop
-# =====================
-for frame_idx in range(start_frame + 1, MAX_FRAMES + 1):
-    # select action index for our reduced action set
-    a_idx, epsilon = select_action(state, frame_idx)
+    # =====================
+    # Main training loop
+    # =====================
+    for frame_idx in range(start_frame + 1, MAX_FRAMES + 1):
+        # select action index for our reduced action set
+        a_idx, epsilon = select_action(state, frame_idx)
 
-    if frame_idx % 1000 == 0:
-        print(f"Frame {frame_idx}, epsilon: {epsilon:.3f}")
+        if frame_idx % 1000 == 0:
+            print(f"Frame {frame_idx}, epsilon: {epsilon:.3f}")
 
-    # Save checkpoint periodically
-    if frame_idx % 10000 == 0:
-        save_checkpoint(frame_idx)
+        # Save checkpoint periodically
+        if frame_idx % 10000 == 0:
+            save_ckpt_util(policy_net, target_net, optimizer, frame_idx, directory=CHECKPOINT_DIR)
 
-    # Map index -> actual ALE action
-    env_action = VALID_ACTIONS[a_idx]
+        # Map index -> actual ALE action
+        env_action = VALID_ACTIONS[a_idx]
 
-    next_obs, reward, terminated, truncated, info = env.step(env_action)
-    done = terminated or truncated
-    episode_reward += reward
+        next_obs, reward, terminated, truncated, info = env.step(env_action)
+        done = terminated or truncated
+        episode_reward += reward
 
-    is_movement = (env_action != 0)
-    movement_reward = MOVE_PENALTY if is_movement else 0.0
-    episode_move_count += is_movement
-    shaped_reward = reward + movement_reward
+        is_movement = (env_action != 0)
+        movement_reward = MOVE_PENALTY if is_movement else 0.0
+        episode_move_count += is_movement
+        shaped_reward = reward + movement_reward
 
+        frame = preprocess_obs(next_obs)
+        stack.append(frame)
+        next_state = get_state_from_stack(stack)
 
-    frame = preprocess_obs(next_obs)
-    stack.append(frame)
-    next_state = get_state_from_stack(stack)
+        # Store index (0,1,2) in replay buffer
+        replay.push(state, a_idx, shaped_reward, next_state, float(done))
+        state = next_state
 
-    # Store index (0,1,2) in replay buffer
-    replay.push(state, a_idx, shaped_reward, next_state, float(done))
-    state = next_state
+        # train after initial replay fill
+        if frame_idx > REPLAY_INIT:
+            optimize_model()
 
-    # train after initial replay fill
-    if frame_idx > REPLAY_INIT:
-        optimize_model()
+        # periodically update target network
+        if frame_idx % TARGET_UPDATE == 0:
+            target_net.load_state_dict(policy_net.state_dict())
 
-    # periodically update target network
-    if frame_idx % TARGET_UPDATE == 0:
-        target_net.load_state_dict(policy_net.state_dict())
-
-    if done:
-        print(f"Frame {frame_idx}, episode reward: {episode_reward:.1f}, episode move count: {episode_move_count}, epsilon: {epsilon:.3f}")
-        obs, info = env.reset()
-        stack = init_state_stack(obs)
-        state = get_state_from_stack(stack)
-        episode_reward = 0.0
-        episode_move_count = 0
+        if done:
+            print(
+                f"Frame {frame_idx}, episode reward: {episode_reward:.1f}, "
+                f"episode move count: {episode_move_count}, epsilon: {epsilon:.3f}"
+            )
+            obs, info = env.reset()
+            stack = init_state_stack(obs)
+            state = get_state_from_stack(stack)
+            episode_reward = 0.0
+            episode_move_count = 0
